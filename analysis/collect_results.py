@@ -1,0 +1,109 @@
+"""Read finished runs from wandb and regenerate the results table in
+results/experiments.md, averaging over seeds."""
+
+from collections import defaultdict
+import math
+from pathlib import Path
+from statistics import mean, stdev
+
+import wandb
+
+ENTITY = "sakshamsingh2002-carnegie-mellon-university"
+PROJECT = "loop_transformers"
+OUT = Path("/home/saksham3/projects/AIRe/loop_transformers/results/experiments.md")
+TASKS = ["z60", "s4", "a5"]
+
+# Every task carries the 2x2 ablation plus the paper replication.
+DESIGN = {
+    task: [("bptt", "fixed"), ("bptt", "curr"),
+           ("stopgrad", "fixed"), ("stopgrad", "curr"),
+           ("stopgrad", "currmax"), ("bptt", "paper")]
+    for task in TASKS
+}
+EXPECTED_RUNS = {
+    f"{task}_{arm}_{sched}_s{seed}"
+    for task, cells in DESIGN.items()
+    for arm, sched in cells
+    for seed in range(86, 90)
+}
+KEYS = [
+    ("final/train_loss", "loss"),
+    ("final/n32/token_acc", "n32_tok"),
+    ("final/n32/seq_acc", "n32_seq"),
+    ("final/n64/token_acc", "n64_tok"),
+    ("final/n64/seq_acc", "n64_seq"),
+    ("final/n128/token_acc", "n128_tok"),
+    ("final/n128/seq_acc", "n128_seq"),
+]
+
+
+def fmt(vals):
+    """mean +/- sd over seeds, or '-' when nothing finished."""
+    vals = [v for v in vals if v is not None and not math.isnan(v)]
+    if not vals:
+        return "—"
+    if len(vals) == 1:
+        return f"{vals[0]:.4f}"
+    return f"{mean(vals):.4f}±{stdev(vals):.4f}"
+
+
+def main():
+    api = wandb.Api()
+    runs = list(api.runs(f"{ENTITY}/{PROJECT}"))
+
+    # cell[(task, arm, sched)][metric] = [value per seed]
+    cell = defaultdict(lambda: defaultdict(list))
+    seeds = defaultdict(set)
+    for r in runs:
+        if r.name not in EXPECTED_RUNS or r.state != "finished":
+            continue
+        parts = r.name.split("_")
+        task, arm, sched, seed = parts[0], parts[1], parts[2], parts[3]
+        seeds[(task, arm, sched)].add(seed)
+        for key, short in KEYS:
+            v = r.summary.get(key)
+            # A job preempted after its last step resumes with nothing left to
+            # run, so final/train_loss is never written. wandb's summary still
+            # holds the last logged train/loss, so fall back to that.
+            if key == "final/train_loss" and (
+                v is None or (isinstance(v, float) and math.isnan(v))
+            ):
+                v = r.summary.get("train/loss")
+            cell[(task, arm, sched)][short].append(v)
+
+    lines = []
+    lines.append("# Results\n")
+    lines.append("Each task carries the 2x2 ablation {bptt, stopgrad} x "
+                 "{fixed-n, curriculum} plus the paper replication. "
+                 "4 seeds (86-89), 60k steps each; 60 runs total.\n")
+    lines.append("`paper` = Appendix D exactly: stages n_max in {4,8,16,32}, "
+                 "lengths sampled uniformly within a stage, promotion at "
+                 "per-token acc >= 0.98, T = n; horizon curriculum on A5 only.\n")
+    lines.append("Values are mean±sd over completed seeds. Token chance: Z60 "
+                 "0.0167, S4 0.0417, A5 0.0167; seq chance is ~0 at n=32.\n")
+
+    for task in TASKS:
+        lines.append(f"\n## {task}\n")
+        lines.append("| arm | schedule | seeds | train loss | n=32 tok | n=32 seq "
+                     "| n=64 tok | n=64 seq | n=128 tok | n=128 seq |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
+        for arm, sched in DESIGN[task]:
+            c = cell[(task, arm, sched)]
+            ns = len(seeds[(task, arm, sched)])
+            label = "**paper**" if sched == "paper" else sched
+            lines.append(
+                f"| {arm} | {label} | {ns} | {fmt(c['loss'])} | "
+                f"{fmt(c['n32_tok'])} | {fmt(c['n32_seq'])} | "
+                f"{fmt(c['n64_tok'])} | {fmt(c['n64_seq'])} | "
+                f"{fmt(c['n128_tok'])} | {fmt(c['n128_seq'])} |"
+            )
+
+    OUT.parent.mkdir(parents = True, exist_ok = True)
+    header = OUT.read_text().split("<!-- RESULTS -->")[0] if OUT.exists() else ""
+    OUT.write_text(header + "<!-- RESULTS -->\n" + "\n".join(lines) + "\n")
+    print(f"wrote {OUT}")
+    print("\n".join(lines))
+
+
+if __name__ == "__main__":
+    main()
